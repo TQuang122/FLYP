@@ -237,6 +237,15 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--microbatch-size",
+        type=int,
+        default=0,
+        help="Microbatch size for gradient accumulation. Splits each batch into "
+             "microbatches to reduce peak GPU memory. Default: 0 (disabled). "
+             "Can also be set via MICROBATCH_SIZE env var.",
+    )
+
+    parser.add_argument(
         "--keep-checkpoints",
         type=int,
         default=3,

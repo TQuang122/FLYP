@@ -152,6 +152,19 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
         logger.info(f'start_epoch ({start_epoch}) >= args.epochs ({args.epochs}), nothing to train')
         return
 
+    microbatch_size = getattr(args, 'microbatch_size', 0)
+    if microbatch_size <= 0 or microbatch_size >= args.batch_size:
+        try:
+            microbatch_size = int(os.environ.get('MICROBATCH_SIZE', '0'))
+        except (ValueError, TypeError):
+            microbatch_size = 0
+
+    use_microbatch = microbatch_size > 0 and microbatch_size < args.batch_size
+    if use_microbatch:
+        num_micro = (args.batch_size + microbatch_size - 1) // microbatch_size
+        logger.info(f'Using gradient accumulation: {num_micro} microbatches of size {microbatch_size} '
+                    f'(effective batch size {args.batch_size})')
+
     stats = []
     best_ood_acc = -1.0
     for epoch in range(start_epoch, args.epochs):
@@ -176,28 +189,50 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
                 ft_iterator = iter(ft_dataloader)
                 ft_batch = next(ft_iterator)
 
-
             ft_image, ft_text = ft_batch
             ft_image, ft_text = ft_image.cuda(), ft_text.cuda()
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                ft_image_features, ft_text_features, logit_scale2 = model(
-                    ft_image, ft_text)
-                ft_clip_loss = clip_loss_fn(ft_image_features,
-                                            ft_text_features,
-                                            logit_scale2[0])
+            if use_microbatch:
+                batch_loss_val = 0.0
+                for j in range(num_micro):
+                    start_idx = j * microbatch_size
+                    end_idx = min(start_idx + microbatch_size, args.batch_size)
+                    micro_image = ft_image[start_idx:end_idx]
+                    micro_text = ft_text[start_idx:end_idx]
 
-            scaler.scale(ft_clip_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        ft_image_features, ft_text_features, logit_scale2 = model(
+                            micro_image, micro_text)
+                        micro_loss = clip_loss_fn(ft_image_features,
+                                                  ft_text_features,
+                                                  logit_scale2[0])
 
-            id_flyp_loss_sum += ft_clip_loss.item()
+                    scaler.scale(micro_loss / num_micro).backward()
+                    batch_loss_val += micro_loss.item()
+
+                scaler.step(optimizer)
+                scaler.update()
+                loss_val = batch_loss_val / num_micro
+            else:
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    ft_image_features, ft_text_features, logit_scale2 = model(
+                        ft_image, ft_text)
+                    ft_clip_loss = clip_loss_fn(ft_image_features,
+                                                ft_text_features,
+                                                logit_scale2[0])
+
+                scaler.scale(ft_clip_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                loss_val = ft_clip_loss.item()
+
+            id_flyp_loss_sum += loss_val
 
             if i % print_every == 0:
                 percent_complete = 100 * i / num_batches
                 logger.info(
                     f"Train Epoch: {epoch} [{percent_complete:.0f}% {i}/{num_batches}]\t"
-                    f"ID FLYP Loss: {ft_clip_loss.item():.4f}")
+                    f"ID FLYP Loss: {loss_val:.4f}")
 
         id_flyp_loss_avg = id_flyp_loss_sum / num_batches
 
