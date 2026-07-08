@@ -25,10 +25,10 @@ def cleanup_old_checkpoints(save_dir, keep_last=3, logger=None):
         return
     import re as re_m
     ckpt_files = [f for f in os.listdir(save_dir) if re_m.match(r'checkpoint_\d+\.pt', f)]
-    if len(ckpt_files) <= keep_last:
+    if keep_last > 0 and len(ckpt_files) <= keep_last:
         return
     epochs = sorted([int(re_m.search(r'checkpoint_(\d+)\.pt', f).group(1)) for f in ckpt_files])
-    epochs_to_delete = epochs[:-keep_last]
+    epochs_to_delete = epochs if keep_last <= 0 else epochs[:-keep_last]
     for ep in epochs_to_delete:
         for suffix in ['checkpoint', 'optim', 'scaler']:
             fpath = os.path.join(save_dir, f'{suffix}_{ep}.pt')
@@ -38,6 +38,10 @@ def cleanup_old_checkpoints(save_dir, keep_last=3, logger=None):
                     logger.info(f'Deleted old checkpoint: {fpath}')
     if logger:
         logger.info(f'Cleaned up {len(epochs_to_delete)} old checkpoint(s), keeping last {keep_last}')
+
+
+def prepare_checkpoint_dir_for_save(save_dir, keep_last=3, logger=None):
+    cleanup_old_checkpoints(save_dir, keep_last=max(keep_last - 1, 0), logger=logger)
 
 
 def log_wandb_epoch(args, epoch_stats):
@@ -126,6 +130,8 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
                 model = model.cuda()
 
                 optim_path = os.path.join(ckpt_dir, f'optim_{latest_epoch}.pt')
+                if not os.path.exists(optim_path):
+                    optim_path = os.path.join(ckpt_dir, 'optim_latest.pt')
                 if os.path.exists(optim_path):
                     try:
                         optim_state = torch.load(optim_path, map_location='cuda')
@@ -136,6 +142,8 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
                         logger.info('Continuing without optimizer state (will start from scratch lr schedule)')
 
                 scaler_path = os.path.join(ckpt_dir, f'scaler_{latest_epoch}.pt')
+                if not os.path.exists(scaler_path):
+                    scaler_path = os.path.join(ckpt_dir, 'scaler_latest.pt')
                 if os.path.exists(scaler_path):
                     try:
                         scaler_state = torch.load(scaler_path, map_location='cuda')
@@ -248,14 +256,23 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
         # Saving model
         if args.save is not None:
             os.makedirs(args.save, exist_ok=True)
+            keep = getattr(args, 'keep_checkpoints', 3)
+            prepare_checkpoint_dir_for_save(args.save, keep_last=keep, logger=logger)
+
             model_path = os.path.join(args.save, f'checkpoint_{epoch}.pt')
             logger.info('Saving model to' + str(model_path))
             model.module.save(model_path)
-            optim_path = os.path.join(args.save, f'optim_{epoch}.pt')
-            torch.save(optimizer.state_dict(), optim_path)
-            scaler_path = os.path.join(args.save, f'scaler_{epoch}.pt')
-            torch.save(scaler.state_dict(), scaler_path)
-            keep = getattr(args, 'keep_checkpoints', 3)
+            checkpoint_state = getattr(args, 'checkpoint_state', 'latest')
+            if checkpoint_state == 'all':
+                optim_path = os.path.join(args.save, f'optim_{epoch}.pt')
+                torch.save(optimizer.state_dict(), optim_path)
+                scaler_path = os.path.join(args.save, f'scaler_{epoch}.pt')
+                torch.save(scaler.state_dict(), scaler_path)
+            elif checkpoint_state == 'latest':
+                optim_path = os.path.join(args.save, 'optim_latest.pt')
+                torch.save(optimizer.state_dict(), optim_path)
+                scaler_path = os.path.join(args.save, 'scaler_latest.pt')
+                torch.save(scaler.state_dict(), scaler_path)
             cleanup_old_checkpoints(args.save, keep_last=keep, logger=logger)
 
         ood_acc = 0
@@ -282,10 +299,11 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
             best_path = os.path.join(args.save, 'best.pt')
             logger.info(f'New best OOD acc {ood_acc:.4f}, saving to {best_path}')
             model.module.save(best_path)
-            best_optim_path = os.path.join(args.save, 'best_optim.pt')
-            torch.save(optimizer.state_dict(), best_optim_path)
-            best_scaler_path = os.path.join(args.save, 'best_scaler.pt')
-            torch.save(scaler.state_dict(), best_scaler_path)
+            if getattr(args, 'checkpoint_state', 'latest') == 'all':
+                best_optim_path = os.path.join(args.save, 'best_optim.pt')
+                torch.save(optimizer.state_dict(), best_optim_path)
+                best_scaler_path = os.path.join(args.save, 'best_scaler.pt')
+                torch.save(scaler.state_dict(), best_scaler_path)
         stats.append(epoch_stats)
         stats_df = pd.DataFrame(stats)
         log_dir = "expt_logs/" + args.exp_name + "/" + "_BS" + str(
