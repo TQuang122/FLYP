@@ -253,6 +253,14 @@ def parse_arguments():
              "Older checkpoints are deleted to save disk space. Default: 3.",
     )
 
+    parser.add_argument(
+        "--checkpoint-state",
+        choices=("none", "latest", "all"),
+        default="latest",
+        help="Optimizer/scaler checkpoint retention mode. Use 'latest' on Kaggle "
+             "to keep resume state without storing one optimizer copy per epoch.",
+    )
+
     parsed_args = parser.parse_args()
 
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"

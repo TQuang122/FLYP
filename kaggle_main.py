@@ -288,6 +288,10 @@ def build_train_command() -> list[str]:
     if keep_cp:
         cmd.append(f"--keep-checkpoints={keep_cp}")
 
+    checkpoint_state = os.environ.get("CHECKPOINT_STATE", "latest")
+    if checkpoint_state:
+        cmd.append(f"--checkpoint-state={checkpoint_state}")
+
     microbatch = os.environ.get("MICROBATCH_SIZE")
     if microbatch:
         cmd.append(f"--microbatch-size={microbatch}")
