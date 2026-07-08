@@ -35,9 +35,8 @@ sys.modules["src.models.utils"].get_logits = object
 sys.modules["src.models.zeroshot"].get_zeroshot_classifier = object
 sys.modules["src.datasets.laion"].get_data = object
 
-prepare_checkpoint_dir_for_save = importlib.import_module(
-    "src.models.flyp_loss"
-).prepare_checkpoint_dir_for_save
+flyp_loss = importlib.import_module("src.models.flyp_loss")
+prepare_checkpoint_dir_for_save = flyp_loss.prepare_checkpoint_dir_for_save
 
 
 class CheckpointCleanupTests(unittest.TestCase):
@@ -62,6 +61,12 @@ class CheckpointCleanupTests(unittest.TestCase):
                     "scaler_2.pt",
                 ],
             )
+
+    def test_microbatch_ranges_use_actual_batch_size(self):
+        ranges = flyp_loss.make_microbatch_ranges(actual_batch_size=10, microbatch_size=4)
+
+        self.assertEqual(ranges, [(0, 4), (4, 8), (8, 10)])
+        self.assertTrue(all(start < end for start, end in ranges))
 
 
 if __name__ == "__main__":

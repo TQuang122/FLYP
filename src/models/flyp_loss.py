@@ -44,6 +44,15 @@ def prepare_checkpoint_dir_for_save(save_dir, keep_last=3, logger=None):
     cleanup_old_checkpoints(save_dir, keep_last=max(keep_last - 1, 0), logger=logger)
 
 
+def make_microbatch_ranges(actual_batch_size, microbatch_size):
+    if actual_batch_size <= 0:
+        return []
+    return [
+        (start, min(start + microbatch_size, actual_batch_size))
+        for start in range(0, actual_batch_size, microbatch_size)
+    ]
+
+
 def log_wandb_epoch(args, epoch_stats):
     if not getattr(args, 'use_wandb', False):
         return
@@ -202,9 +211,8 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
 
             if use_microbatch:
                 batch_loss_val = 0.0
-                for j in range(num_micro):
-                    start_idx = j * microbatch_size
-                    end_idx = min(start_idx + microbatch_size, args.batch_size)
+                microbatch_ranges = make_microbatch_ranges(ft_image.shape[0], microbatch_size)
+                for start_idx, end_idx in microbatch_ranges:
                     micro_image = ft_image[start_idx:end_idx]
                     micro_text = ft_text[start_idx:end_idx]
 
@@ -215,12 +223,12 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
                                                   ft_text_features,
                                                   logit_scale2[0])
 
-                    scaler.scale(micro_loss / num_micro).backward()
+                    scaler.scale(micro_loss / len(microbatch_ranges)).backward()
                     batch_loss_val += micro_loss.item()
 
                 scaler.step(optimizer)
                 scaler.update()
-                loss_val = batch_loss_val / num_micro
+                loss_val = batch_loss_val / len(microbatch_ranges)
             else:
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     ft_image_features, ft_text_features, logit_scale2 = model(
