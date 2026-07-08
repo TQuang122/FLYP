@@ -11,6 +11,25 @@ from src.args import parse_arguments
 import logging
 import random
 
+
+def start_wandb(args, logging_path):
+    if not os.environ.get('WANDB_API_KEY'):
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        return None
+
+    run_name = "_BS" + str(args.batch_size) + "_WD" + str(
+        args.wd) + "_LR" + str(args.lr) + "_run" + str(args.run)
+    return wandb.init(project=os.environ.get('WANDB_PROJECT', 'flyp-iwildcam'),
+                      name=os.environ.get('WANDB_RUN_NAME', run_name),
+                      group=os.environ.get('WANDB_GROUP', args.exp_name),
+                      dir=logging_path,
+                      config=vars(args))
+
+
 def main(args):
 
     ###logging##################################################################
@@ -28,6 +47,8 @@ def main(args):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     assert args.save is not None, 'Please provide a path to store models'
+    wandb_run = start_wandb(args, logging_path)
+    args.use_wandb = wandb_run is not None
     #############################################################################
 
     # Initialize the CLIP encoder
@@ -40,6 +61,9 @@ def main(args):
     else:
         finetuned_checkpoint = flyp_loss(args, clip_encoder,
                                             classification_head, logger)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == '__main__':

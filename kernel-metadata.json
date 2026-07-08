@@ -1,0 +1,17 @@
+{
+  "id": "klinh1912/kernel-flyp-reproduce",
+  "title": "Kernel-FLYP-Reproduce",
+  "code_file": "kaggle_main.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "thanhquang71/iwildcam-v2-0-2020-wilds-dataset"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
