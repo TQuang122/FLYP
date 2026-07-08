@@ -228,6 +228,22 @@ def parse_arguments():
         help="minimum LR for cosine scheduler",
     )
 
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume training from. "
+             "Loads checkpoint_{epoch}.pt and optim_{epoch}.pt with highest epoch number.",
+    )
+
+    parser.add_argument(
+        "--keep-checkpoints",
+        type=int,
+        default=3,
+        help="Number of most recent checkpoints to retain during cleanup. "
+             "Older checkpoints are deleted to save disk space. Default: 3.",
+    )
+
     parsed_args = parser.parse_args()
 
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"

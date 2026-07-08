@@ -19,6 +19,40 @@ from src.datasets.laion import get_data
 import src.datasets as datasets
 
 
+def cleanup_old_checkpoints(save_dir, keep_last=3, logger=None):
+    """Delete old checkpoint files, keeping only the `keep_last` most recent epochs."""
+    if not os.path.isdir(save_dir):
+        return
+    import re as re_m
+    ckpt_files = [f for f in os.listdir(save_dir) if re_m.match(r'checkpoint_\d+\.pt', f)]
+    if len(ckpt_files) <= keep_last:
+        return
+    epochs = sorted([int(re_m.search(r'checkpoint_(\d+)\.pt', f).group(1)) for f in ckpt_files])
+    epochs_to_delete = epochs[:-keep_last]
+    for ep in epochs_to_delete:
+        for suffix in ['checkpoint', 'optim', 'scaler']:
+            fpath = os.path.join(save_dir, f'{suffix}_{ep}.pt')
+            if os.path.exists(fpath):
+                os.remove(fpath)
+                if logger:
+                    logger.info(f'Deleted old checkpoint: {fpath}')
+    if logger:
+        logger.info(f'Cleaned up {len(epochs_to_delete)} old checkpoint(s), keeping last {keep_last}')
+
+
+def log_wandb_epoch(args, epoch_stats):
+    if not getattr(args, 'use_wandb', False):
+        return
+
+    import wandb
+
+    metrics = {}
+    for key, value in epoch_stats.items():
+        metric_name = key.replace(' ', '/')
+        metrics[metric_name] = value
+    wandb.log(metrics, step=epoch_stats['epoch'])
+
+
 def flyp_loss(args, clip_encoder, classification_head, logger):
     assert args.train_dataset is not None, "Please provide a training dataset."
     logger.info('Fine-tuning Using FLYP Loss')
@@ -67,12 +101,60 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
     total_params = clip_params
     params = [p for p in total_params if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    use_amp = os.environ.get('USE_AMP', '1') == '1'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     scheduler = cosine_lr(optimizer, args.lr, args.warmup_length,
                           args.epochs * num_batches, args.min_lr)
 
+    start_epoch = 0
+    if args.resume:
+        ckpt_dir = args.resume
+        if os.path.isdir(ckpt_dir):
+            import re as re_m
+            ckpt_files = [f for f in os.listdir(ckpt_dir) if re_m.match(r'checkpoint_\d+\.pt', f)]
+            if ckpt_files:
+                epochs_found = sorted([int(re_m.search(r'checkpoint_(\d+)\.pt', f).group(1)) for f in ckpt_files])
+                latest_epoch = epochs_found[-1]
+                start_epoch = latest_epoch + 1
+
+                ckpt_path = os.path.join(ckpt_dir, f'checkpoint_{latest_epoch}.pt')
+                logger.info(f'Resuming from checkpoint: {ckpt_path}')
+                logger.info(f'Starting from epoch {start_epoch} (resumed at epoch {latest_epoch})')
+
+                model.module = model.module.load(ckpt_path)
+                model = model.cuda()
+
+                optim_path = os.path.join(ckpt_dir, f'optim_{latest_epoch}.pt')
+                if os.path.exists(optim_path):
+                    try:
+                        optim_state = torch.load(optim_path, map_location='cuda')
+                        optimizer.load_state_dict(optim_state)
+                        logger.info(f'Loaded optimizer state from {optim_path}')
+                    except Exception as e:
+                        logger.warning(f'Failed to load optimizer state from {optim_path}: {e}')
+                        logger.info('Continuing without optimizer state (will start from scratch lr schedule)')
+
+                scaler_path = os.path.join(ckpt_dir, f'scaler_{latest_epoch}.pt')
+                if os.path.exists(scaler_path):
+                    try:
+                        scaler_state = torch.load(scaler_path, map_location='cuda')
+                        scaler.load_state_dict(scaler_state)
+                        logger.info(f'Loaded GradScaler state from {scaler_path}')
+                    except Exception as e:
+                        logger.warning(f'Failed to load GradScaler state from {scaler_path}: {e}')
+            else:
+                logger.warning(f'No checkpoints found in {ckpt_dir}, starting from scratch')
+        else:
+            logger.warning(f'Resume directory not found: {ckpt_dir}, starting from scratch')
+
+    if start_epoch >= args.epochs:
+        logger.info(f'start_epoch ({start_epoch}) >= args.epochs ({args.epochs}), nothing to train')
+        return
+
     stats = []
-    for epoch in range(0, args.epochs):
+    best_ood_acc = -1.0
+    for epoch in range(start_epoch, args.epochs):
         print("Epoch : ", epoch)
         epoch_stats = {}
         epoch_stats['epoch'] = epoch
@@ -86,7 +168,7 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
             step = i + epoch * num_batches
             if epoch != -1:
                 scheduler(step)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             try:
                 ft_batch = next(ft_iterator)
@@ -98,14 +180,16 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
             ft_image, ft_text = ft_batch
             ft_image, ft_text = ft_image.cuda(), ft_text.cuda()
 
-            ft_image_features, ft_text_features, logit_scale2 = model(
-                ft_image, ft_text)
-            ft_clip_loss = clip_loss_fn(ft_image_features,
-                                        ft_text_features,
-                                        logit_scale2[0])
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                ft_image_features, ft_text_features, logit_scale2 = model(
+                    ft_image, ft_text)
+                ft_clip_loss = clip_loss_fn(ft_image_features,
+                                            ft_text_features,
+                                            logit_scale2[0])
 
-            ft_clip_loss.backward()
-            optimizer.step()
+            scaler.scale(ft_clip_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             id_flyp_loss_sum += ft_clip_loss.item()
 
@@ -134,6 +218,10 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
             model.module.save(model_path)
             optim_path = os.path.join(args.save, f'optim_{epoch}.pt')
             torch.save(optimizer.state_dict(), optim_path)
+            scaler_path = os.path.join(args.save, f'scaler_{epoch}.pt')
+            torch.save(scaler.state_dict(), scaler_path)
+            keep = getattr(args, 'keep_checkpoints', 3)
+            cleanup_old_checkpoints(args.save, keep_last=keep, logger=logger)
 
         ood_acc = 0
         num_datasets = 0
@@ -153,12 +241,23 @@ def flyp_loss(args, clip_encoder, classification_head, logger):
         logger.info(f"Avg OOD Acc : {ood_acc:.4f}")
         logger.info(f"Avg ID FLYP Loss : {id_flyp_loss_avg:.4f}")
         epoch_stats['Avg ID FLYP Loss'] = round(id_flyp_loss_avg, 4)
+
+        if args.save is not None and ood_acc > best_ood_acc:
+            best_ood_acc = ood_acc
+            best_path = os.path.join(args.save, 'best.pt')
+            logger.info(f'New best OOD acc {ood_acc:.4f}, saving to {best_path}')
+            model.module.save(best_path)
+            best_optim_path = os.path.join(args.save, 'best_optim.pt')
+            torch.save(optimizer.state_dict(), best_optim_path)
+            best_scaler_path = os.path.join(args.save, 'best_scaler.pt')
+            torch.save(scaler.state_dict(), best_scaler_path)
         stats.append(epoch_stats)
         stats_df = pd.DataFrame(stats)
         log_dir = "expt_logs/" + args.exp_name + "/" + "_BS" + str(
             args.batch_size) + "_WD" + str(args.wd) + "_LR" + str(args.lr) + "_run" + str(args.run)
         os.makedirs(log_dir, exist_ok=True)
         stats_df.to_csv(log_dir + '/stats.tsv', sep='\t')
+        log_wandb_epoch(args, epoch_stats)
 
     if args.save is not None:
         return model_path
